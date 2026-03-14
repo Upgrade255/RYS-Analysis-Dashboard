@@ -1,3 +1,6 @@
+![Dashboard Screenshot](sc1.png)
+![Dashboard Screenshot](sc2.png)
+
 # RYS Neuroanatomy Dashboard
 
 Based on [*LLM Neuroanatomy: How I Topped the LLM Leaderboard Without Changing a Single Weight*](https://dnhkng.github.io/posts/rys/) by David Noel Ng (2026)
