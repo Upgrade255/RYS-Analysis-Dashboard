@@ -7,7 +7,7 @@
 Based on [*LLM Neuroanatomy: How I Topped the LLM Leaderboard Without Changing a Single Weight*](https://dnhkng.github.io/posts/rys/) by David Noel Ng (2026)
 
 This is still a work in progress. Feel free to suggest ideas, fixes, or corrections.
-This was coded in a few hours using the writeup above, Claude for quick code writing, and for ideas.
+This was coded in a few hours using the writeup above, Claude for quick code writing, and I provided some functionality ideas.
 Things may be broken, or may not be accurate, but those should get fixed.
 
 ---
