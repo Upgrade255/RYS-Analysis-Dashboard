@@ -318,7 +318,7 @@ those are just my initial thoughts.
 ## Credits & Attribution
 
 The RYS (Repeat Yourself) technique, the neuroanatomy framing, and the
-original sweep engine design are the work of **David Noel Ng**:
+original sweep concept and test(s) design are the work of **David Noel Ng**:
 
 > *LLM Neuroanatomy: How I Topped the LLM Leaderboard Without Changing
 > a Single Weight* — https://dnhkng.github.io/posts/rys/
