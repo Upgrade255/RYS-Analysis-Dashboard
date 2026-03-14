@@ -34,7 +34,7 @@ This tool makes that workflow accessible through a Gradio UI, and extends it wit
 Please install PyTorch for CPU or CUDA (GPU) based on your needs prior to installing requirements.
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rys-dashboard.git
+git clone https://github.com/Upgrade255/rys-dashboard.git
 cd rys-dashboard
 pip install -r requirements.txt
 python app.py
