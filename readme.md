@@ -56,6 +56,7 @@ This tool makes that workflow accessible through a Gradio UI, and extends it wit
 
 \## Quick Start
 
+Please install pytorch for CPU or CUDA(GPU) based on your needs prior to installing requirements.
 
 
 ```bash
