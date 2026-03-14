@@ -121,10 +121,22 @@ def load_rys_model(dropdown_model, typed_model):
         return "Select a model", None, None, *[gr.update() for _ in layer_buttons]
     engine = RYSEngine(model_name)
     config = AutoConfig.from_pretrained(model_name)
+    def _cfg(attr, fallback="?"):
+        return getattr(config, attr, None) or getattr(config, "text_config", object()).__class__.__dict__.get(attr,
+                                                                                                              fallback)
+
+    num_layers = (getattr(config, "num_hidden_layers", None)
+                  or getattr(config, "num_layers", None)
+                  or getattr(config, "n_layer", None)
+                  or engine.N)  # fall back to what the engine actually found
+
+    hidden = getattr(config, "hidden_size", getattr(config, "d_model", "?"))
+    n_heads = getattr(config, "num_attention_heads", getattr(config, "n_head", "?"))
+
     info = (f"Loaded {model_name}\n"
-            f"Layers: {config.num_hidden_layers}\n"
-            f"Hidden Size: {config.hidden_size}\n"
-            f"Attention Heads: {config.num_attention_heads}")
+            f"Layers: {num_layers}\n"
+            f"Hidden Size: {hidden}\n"
+            f"Attention Heads: {n_heads}")
     layer_max = engine.N - 1
     updates = []
     for i in range(len(layer_buttons)):
