@@ -290,10 +290,15 @@ I want to first use this to analyze how using RYS during initial training can ef
 These are more ideas I dona't have time for (currently)
 
 Forcing 'neuro-organs' to form in small models?
+
 forming and extracing a complex nerual calulator with defined operational layers? (finding the 'math layer group' and masking all but one layer per problem type to force structure?)
+
 Are the groups of layers reasonably seperatable or relevent if they are never allowed to form naturally in the first place?
+
 What kind of knowledge distallation is available with this analysis, could we use direct knowledge distillation to directly copy or continue trianing and finetuning on the portions of the models deemed 'good'?
+
 If the heatmaps show which layers are assoicated with that particular 'field of thinking', while also demonstrating where meaningful thinking happens, we could eventuallky learn to seperate translation layers from poorly trained or genrealized layers.
+
 
 
 BUT
