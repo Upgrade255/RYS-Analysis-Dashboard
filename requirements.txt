@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────────
+# RYS Neuroanatomy Dashboard — requirements.txt
+# ─────────────────────────────────────────────────────────────────
+# Install core deps:
+#   pip install -r requirements.txt
+#
+# For optional quantization backends, see the sections below.
+# ─────────────────────────────────────────────────────────────────
+
+# ── Core ──────────────────────────────────────────────────────────
+torch>=2.1.0
+transformers>=4.40.0
+gradio>=4.20.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+safetensors>=0.4.0
+
+# ── Optional: quantization ────────────────────────────────────────
+# Uncomment what you need.
+# Each backend is independent — install only the ones you use.
+
+# bitsandbytes — 4-bit (NF4) and 8-bit (LLM.int8) quantization
+# Required for quant_mode="4bit" or "8bit" in LayerSurgeon / RYSEngine
+# bitsandbytes>=0.43.0
+
+# AutoAWQ — AWQ quantization
+# Required for quant_mode="awq"
+# autoawq>=0.2.0
+
+# AutoGPTQ — GPTQ quantization
+# Required for quant_mode="gptq"
+# auto-gptq>=0.7.0
+
+# llama-cpp-python — GGUF model loading
+# Required for quant_mode="gguf"
+# Install with CUDA support for GPU inference:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+# CPU only:
+#   pip install llama-cpp-python
+# llama-cpp-python>=0.2.0
+
+# ExLlamaV2 — most VRAM-efficient quantization for large models
+# Required for quant_mode="exl2"
+# Cannot be installed via pip on all platforms.
+# See: https://github.com/turboderp/exllamav2
+# exllamav2>=0.1.0
+
+# ── Optional: training datasets ───────────────────────────────────
+# Required only if loading datasets from HuggingFace Hub by name
+# (e.g. "tatsu-lab/alpaca") in the Training tabs.
+# datasets>=2.18.0
+
+# ── Optional: accelerated training ───────────────────────────────
+# accelerate>=0.29.0

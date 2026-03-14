@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────
+# .gitignore — RYS Neuroanatomy Dashboard
+# ─────────────────────────────────────────────────────────────────
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ── Model weights — NEVER commit these ───────────────────────────
+# They are multi-GB binary files and belong on HuggingFace Hub,
+# not in a git repository.
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.ggml
+*.exl2
+*.npy          # sweep matrices can be large; re-run sweeps locally
+
+# Exported surgery models and training checkpoints
+# (keep the surgery_manifest.json but not the weights)
+*/model.safetensors
+*/pytorch_model.bin
+*/model-*-of-*.safetensors
+*/model-*-of-*.bin
+
+# ── HuggingFace cache ─────────────────────────────────────────────
+.cache/
+~/.cache/huggingface/
+
+# ── Training outputs ──────────────────────────────────────────────
+# Uncomment if you don't want any training output dirs tracked.
+# training_output/
+# groundup_output/
+# layer_aware_output/
+# stretch_distill_output/
+
+# Keep training logs and manifests (small JSON files) — useful for
+# reproducibility. Exclude the actual weights inside those dirs.
+**/epoch_*/
+**/step_*/
+**/final/
+
+# ── Gradio temp files ─────────────────────────────────────────────
+gradio_cached_examples/
+*.tmp
+
+# ── OS files ──────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── IDEs ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Jupyter ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs ──────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── What IS tracked (override the above for small data files) ─────
+# Question sets and probe banks are small JSON — keep them
+!question_sets/
+!question_sets/*.json
+# Surgery manifests are small and useful for reproducibility
+!**/surgery_manifest.json
+# Training logs are small
+!**/training_log.json
