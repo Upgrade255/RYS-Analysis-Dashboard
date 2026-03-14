@@ -171,8 +171,13 @@ But those are just my initial thoughts.
 
 The RYS (Repeat Yourself) technique, the neuroanatomy framing, and the original sweep concept and test design are the work of **David Noel Ng**:
 
-> *LLM Neuroanatomy: How I Topped the LLM Leaderboard Without Changing a Single Weight* — https://dnhkng.github.io/posts/rys/
-> Licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+@article{ng2026rys,
+  title   = {LLM Neuroanatomy: How I Topped the LLM Leaderboard Without Changing a Single Weight},
+  author  = {Ng, David Noel},
+  year    = {2026},
+  month   = {March},
+  url     = {https://dnhkng.github.io/posts/rys/}
+}
 
 This dashboard is an independent implementation and extension built on top of those concepts. The RYS engine, layer surgery, training systems, and UI are original work released under the MIT License.
 
