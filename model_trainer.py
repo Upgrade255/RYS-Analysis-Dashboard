@@ -74,22 +74,56 @@ def _collate(batch):
     return out
 
 
+# Column name aliases: maps common HF dataset column names → (prompt_key, response_key)
+_COLUMN_ALIASES = [
+    ("prompt",      "response"),       # Dahoas/full-hh-rlhf, Dahoas/rm-static
+    ("instruction", "output"),         # tatsu-lab/alpaca, garage-bAInd/Open-Platypus
+    ("instruction", "response"),       # some instruction datasets
+    ("question",    "answer"),         # openai/gsm8k, microsoft/orca-math-word-problems-200k
+    ("question",    "response"),       # Open-Orca/OpenOrca
+    ("query",       "response"),       # meta-math/MetaMathQA
+    ("input",       "output"),         # various
+    ("text",        "response"),       # fallback
+]
+
+def _detect_columns(row: dict):
+    """Return (prompt_key, response_key) from a sample row, or raise."""
+    for pk, rk in _COLUMN_ALIASES:
+        if pk in row and rk in row:
+            return pk, rk
+    raise KeyError(
+        f"Could not find prompt/response columns in dataset. "
+        f"Found columns: {list(row.keys())}. "
+        f"Supported pairs: {_COLUMN_ALIASES}"
+    )
+
+
 def load_dataset_from_source(source, tokenizer, max_length=512):
     """
     source: list of (prompt, response) tuples
           | path to JSON file containing [{"prompt":..,"response":..}]
-          | HuggingFace dataset name string (loads train split, expects 'prompt'+'response' cols)
+          | HuggingFace dataset name string
+
+    Automatically detects common column name variants across HF datasets:
+      prompt/response, instruction/output, instruction/response,
+      question/response, input/output.
     """
     if isinstance(source, list):
         pairs = source
     elif isinstance(source, str) and source.endswith(".json"):
         with open(source) as f:
             data = json.load(f)
-        pairs = [(d["prompt"], d["response"]) for d in data]
+        # Support both {prompt, response} and {instruction, output} in JSON too
+        if data:
+            pk, rk = _detect_columns(data[0])
+        pairs = [(d[pk], d[rk]) for d in data]
     else:
         from datasets import load_dataset as hf_load
         ds = hf_load(source, split="train")
-        pairs = [(row["prompt"], row["response"]) for row in ds]
+        first = dict(ds[0])
+        pk, rk = _detect_columns(first)
+        print(f"[Dataset] Using columns: prompt='{pk}', response='{rk}'")
+        pairs = [(row[pk], row[rk]) for row in ds]
     return PairDataset(pairs, tokenizer, max_length=max_length)
 
 
@@ -146,8 +180,10 @@ class LoRALinear(nn.Module):
         self.scaling = alpha / rank
         in_f = linear.in_features
         out_f = linear.out_features
-        self.lora_A = nn.Parameter(torch.randn(rank, in_f) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
+        # Initialise on the same device as the wrapped layer
+        device = next(linear.parameters()).device
+        self.lora_A = nn.Parameter(torch.randn(rank, in_f, device=device) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=device))
         # Freeze original weights
         for p in linear.parameters():
             p.requires_grad = False

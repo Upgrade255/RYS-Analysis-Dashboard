@@ -48,8 +48,9 @@ import math
 import copy
 import time
 import random
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, Dict, List, Tuple
+from typing import Optional, Callable, Dict, List, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -219,81 +220,293 @@ class GradientRouter:
 # Layer specialisation probe
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SpecialisationProbe:
+class RYSProbe:
     """
-    Runs lightweight RYS-style ablation probes during training to measure
-    how much each layer contributes to each cognitive type.
+    RYS sweep probe — finds which layer range is ALREADY GOOD at a task.
 
-    For each layer i, temporarily disable it (skip its forward pass) and
-    measure the loss change on a small typed probe set.
-    A large loss increase when layer i is disabled → layer i matters a lot
-    for that type → it's specialising.
+    Core measurement (identical to RYSEngine.sweep)
+    ────────────────────────────────────────────────
+    score(i, j) = run_test_with_rys(i, j, loops=1) − baseline
 
-    Returns a matrix: [num_layers × num_types] of importance scores.
+    Positive delta → repeating that range IMPROVES performance on the probe
+    questions → those layers are already doing useful task-specific work.
+    These are the layers we want to finetune further, not the ones that
+    hurt when disabled.
+
+    Scoring metric: mean log-prob per answer token (higher = better, always
+    negative).  Matches RYSEngine.run_test() exactly.
+
+    Phase 2 — Minimal subset shrink
+    ────────────────────────────────
+    Starting from the best (start, end), greedily shrink from both ends.
+    At each step, try applying RYS on [start+1, end] and [start, end-1].
+    Keep whichever sub-range still scores >= min_subset_ratio * best_score.
+    Stop when neither end can be dropped without losing too much signal.
+
+    This finds the tightest range that still demonstrates math competence,
+    giving a precise finetune target rather than a padded bounding box.
     """
 
-    def __init__(self, model, tokenizer, device, probe_samples_per_type: int = 4):
-        self.model    = model
+    def __init__(self, model, tokenizer, device,
+                 max_pairs: int = 4,
+                 log: Callable = print):
+        self.model     = model
         self.tokenizer = tokenizer
-        self.device   = device
-        self.n        = probe_samples_per_type
-        self.layers   = _get_layer_stack(model)
+        self.device    = device
+        self.max_pairs = max_pairs
+        self.log       = log
+        self.layers    = _get_layer_stack(model)
+        self.N         = len(self.layers)
         self._orig_forwards = [l.forward for l in self.layers]
 
-    def _disable_layer(self, idx: int):
-        def skip(hidden_states, *a, **kw):
-            return (hidden_states,)
-        self.layers[idx].forward = skip
+    # ── RYS application — mirrors RYSEngine.apply_rys exactly ────────────────
 
-    def _restore_layer(self, idx: int):
-        self.layers[idx].forward = self._orig_forwards[idx]
+    def _apply_rys(self, start: int, end: int, loops: int = 1):
+        """Patch layers[end].forward to repeat [start..end] `loops` extra times."""
+        origs = self._orig_forwards
+        s, e, L = start, end, loops
+
+        def end_layer_forward(hidden_states, *args, **kwargs):
+            outputs = origs[e](hidden_states, *args, **kwargs)
+            if L <= 0:
+                return outputs
+            if isinstance(outputs, (tuple, list)):
+                hs, tail, is_tuple = outputs[0], list(outputs[1:]), True
+            else:
+                hs, tail, is_tuple = outputs, [], False
+            for _ in range(L):
+                for k in range(s, e + 1):
+                    out_k = origs[k](hs, *args, **kwargs)
+                    if isinstance(out_k, (tuple, list)):
+                        hs, tail, is_tuple = out_k[0], list(out_k[1:]), True
+                    else:
+                        hs, tail, is_tuple = out_k, [], False
+            return (hs, *tail) if is_tuple else hs
+
+        self.layers[e].forward = end_layer_forward
 
     def _restore_all(self):
-        for i, layer in enumerate(self.layers):
-            layer.forward = self._orig_forwards[i]
+        for i in range(self.N):
+            self.layers[i].forward = self._orig_forwards[i]
 
-    def _eval_loss(self, pairs: List[Tuple[str, str]]) -> float:
-        """Compute average log-prob loss on a list of (prompt, response) pairs."""
+    # ── Scoring — mirrors RYSEngine.run_test exactly ──────────────────────────
+
+    def _run_test(self, pairs: List[Tuple[str, str]]) -> float:
+        """Mean log-prob per answer token.  Higher = better.  Always negative."""
         if not pairs:
             return 0.0
         self.model.eval()
-        total = 0.0
-        with torch.no_grad():
-            for prompt, response in pairs:
-                text = prompt + " " + response
-                enc  = self.tokenizer(text, return_tensors="pt",
-                                      truncation=True, max_length=256).to(self.device)
-                p_len = len(self.tokenizer(prompt, return_tensors="pt").input_ids[0])
-                labels = enc.input_ids.clone()
-                labels[0, :p_len] = -100
-                out  = self.model(**enc, labels=labels)
-                total += out.loss.item()
-        return total / len(pairs)
+        prompts    = [q + " " for q, _ in pairs]
+        answers    = [a       for _, a in pairs]
+        full_texts = [p + a   for p, a in zip(prompts, answers)]
 
-    def run(self, typed_probe_bank: Dict[str, List[Tuple[str, str]]]) -> Dict[str, List[float]]:
+        full_inputs = self.tokenizer(
+            full_texts, return_tensors="pt", padding=True,
+            truncation=True, max_length=256,
+        ).to(self.device)
+
+        prompt_lengths = [
+            len(self.tokenizer(p, add_special_tokens=True).input_ids)
+            for p in prompts
+        ]
+        answer_ids = [
+            self.tokenizer(a, add_special_tokens=False).input_ids
+            for a in answers
+        ]
+
+        with torch.no_grad():
+            logits = self.model(**full_inputs).logits
+
+        scores = []
+        for i in range(len(pairs)):
+            ans_ids = answer_ids[i]
+            if not ans_ids:
+                continue
+            logprob = 0.0
+            for j, token in enumerate(ans_ids):
+                pos = prompt_lengths[i] + j - 1
+                if pos < 0 or pos >= logits.shape[1]:
+                    continue
+                logprob += torch.log_softmax(
+                    logits[i, pos], dim=-1)[token].item()
+            scores.append(logprob / len(ans_ids))
+
+        return float(sum(scores) / len(scores)) if scores else 0.0
+
+    # ── Phase 1: full RYS sweep ───────────────────────────────────────────────
+
+    def sweep(self, pairs: List[Tuple[str, str]],
+              ) -> Tuple[float, List[List[float]]]:
         """
-        typed_probe_bank: {type_name: [(prompt, response), ...]}
-        Returns: {type_name: [importance_score_per_layer]}
-          score = baseline_loss_delta when layer is disabled
-                  (positive = layer matters, negative = layer hurts)
+        Run RYS(i, j, loops=1) for all valid (i < j) pairs.
+        Returns (baseline, matrix) where matrix[i][j] = delta above baseline.
+        Positive delta = repeating that range improves math performance.
         """
-        results: Dict[str, List[float]] = {t: [] for t in typed_probe_bank}
+        probe_pairs = pairs[:self.max_pairs]
+        baseline    = self._run_test(probe_pairs)
+        matrix      = [[0.0] * self.N for _ in range(self.N)]
+
+        total = self.N * (self.N - 1) // 2
+        done  = 0
+        for i in range(self.N):
+            for j in range(i + 1, self.N):
+                self._restore_all()
+                self._apply_rys(i, j, loops=1)
+                score        = self._run_test(probe_pairs)
+                matrix[i][j] = score - baseline
+                done += 1
+                if done % 10 == 0:
+                    self.log(f"[RYSProbe] Sweep {done}/{total} — "
+                             f"RYS({i},{j}) delta={matrix[i][j]:+.5f}")
+
+        self._restore_all()
+        self.model.train()
+        return baseline, matrix
+
+    # ── Phase 2: minimal subset shrink ───────────────────────────────────────
+
+    def shrink_range(self, pairs: List[Tuple[str, str]],
+                     start: int, end: int,
+                     best_score: float,
+                     min_ratio:  float = 0.75,
+                     ) -> Tuple[int, int, float]:
+        """
+        Greedily shrink [start, end] from both ends using RYS scoring.
+        At each step, try [start+1, end] and [start, end-1].
+        Keep the sub-range that retains the most signal above the floor.
+        Floor = min_ratio * best_score.
+
+        Returns (final_start, final_end, final_score).
+        """
+        probe_pairs = pairs[:self.max_pairs]
+        baseline    = self._run_test(probe_pairs)
+        threshold   = min_ratio * best_score
+        cur_s, cur_e = start, end
+
+        self.log(f"[RYSProbe] Shrink: [{start},{end}] "
+                 f"best_delta={best_score:+.5f}  "
+                 f"floor={threshold:+.5f} ({min_ratio*100:.0f}%)")
+
+        while cur_s < cur_e:
+            # Score [cur_s+1, cur_e]
+            if cur_s + 1 <= cur_e:
+                self._restore_all()
+                self._apply_rys(cur_s + 1, cur_e)
+                s_drop_left = self._run_test(probe_pairs) - baseline
+            else:
+                s_drop_left = float("-inf")
+
+            # Score [cur_s, cur_e-1]
+            if cur_s <= cur_e - 1:
+                self._restore_all()
+                self._apply_rys(cur_s, cur_e - 1)
+                s_drop_right = self._run_test(probe_pairs) - baseline
+            else:
+                s_drop_right = float("-inf")
+
+            self._restore_all()
+
+            can_left  = s_drop_left  >= threshold
+            can_right = s_drop_right >= threshold
+
+            if not can_left and not can_right:
+                self.log(f"[RYSProbe] Cannot shrink: "
+                         f"drop_left={s_drop_left:+.5f}  "
+                         f"drop_right={s_drop_right:+.5f}  "
+                         f"floor={threshold:+.5f}")
+                break
+
+            if can_left and (not can_right or s_drop_left >= s_drop_right):
+                self.log(f"[RYSProbe] ← drop L{cur_s}  "
+                         f"(delta {s_drop_left:+.5f} ≥ floor {threshold:+.5f})")
+                cur_s += 1
+            else:
+                self.log(f"[RYSProbe] → drop L{cur_e}  "
+                         f"(delta {s_drop_right:+.5f} ≥ floor {threshold:+.5f})")
+                cur_e -= 1
+
+        # Final score for the shrunk range
+        self._restore_all()
+        if cur_s < cur_e:
+            self._apply_rys(cur_s, cur_e)
+        final_score = self._run_test(probe_pairs) - baseline
+        self._restore_all()
+        self.model.train()
+
+        self.log(f"[RYSProbe] Minimal range: [{cur_s},{cur_e}]  "
+                 f"delta={final_score:+.5f}  "
+                 f"(original [{start},{end}] delta={best_score:+.5f})")
+        return cur_s, cur_e, final_score
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    def run(self, typed_probe_bank: Dict[str, List[Tuple[str, str]]],
+            find_minimal_subset: bool = True,
+            min_subset_ratio:    float = 0.75,
+            ) -> Dict[str, dict]:
+        """
+        Run a full RYS sweep for each type in the probe bank.
+
+        Returns per-type:
+          {
+            "baseline":     float,   # unmodified log-prob score
+            "best_start":   int,     # range with highest positive RYS delta
+            "best_end":     int,
+            "best_score":   float,   # delta above baseline (positive = good at task)
+            "final_start":  int,     # after minimal-subset shrink
+            "final_end":    int,
+            "final_score":  float,
+            "matrix":       [[float]]
+          }
+        """
+        results = {}
 
         for stype, pairs in typed_probe_bank.items():
             if not pairs:
-                results[stype] = [0.0] * len(self.layers)
+                results[stype] = {
+                    "baseline": 0.0,
+                    "best_start": 0, "best_end": 0, "best_score": 0.0,
+                    "final_start": 0, "final_end": 0, "final_score": 0.0,
+                    "matrix": [],
+                }
                 continue
 
-            probe_pairs = pairs[:self.n]
-            baseline = self._eval_loss(probe_pairs)
-            scores = []
-            for i in range(len(self.layers)):
-                self._disable_layer(i)
-                ablated = self._eval_loss(probe_pairs)
-                self._restore_layer(i)
-                # Positive = disabling hurts = layer is important
-                scores.append(ablated - baseline)
-            results[stype] = scores
+            n_pairs = self.N * (self.N - 1) // 2
+            self.log(f"[RYSProbe] Sweeping type='{stype}'  "
+                     f"{self.N} layers → {n_pairs} RYS pairs ...")
+
+            baseline, matrix = self.sweep(pairs)
+
+            best_start, best_end, best_score = 0, 1, float("-inf")
+            for i in range(self.N):
+                for j in range(i + 1, self.N):
+                    if matrix[i][j] > best_score:
+                        best_score         = matrix[i][j]
+                        best_start, best_end = i, j
+
+            self.log(f"[RYSProbe] Best RYS range for '{stype}': "
+                     f"[{best_start},{best_end}]  "
+                     f"delta={best_score:+.5f}  "
+                     f"(baseline={baseline:.5f})")
+
+            if find_minimal_subset and best_score > 0 and best_start < best_end:
+                fs, fe, fscore = self.shrink_range(
+                    pairs, best_start, best_end,
+                    best_score, min_ratio=min_subset_ratio,
+                )
+            else:
+                fs, fe, fscore = best_start, best_end, best_score
+
+            results[stype] = {
+                "baseline":   baseline,
+                "best_start": best_start,
+                "best_end":   best_end,
+                "best_score": best_score,
+                "final_start": fs,
+                "final_end":   fe,
+                "final_score": fscore,
+                "matrix":      matrix,
+            }
 
         self._restore_all()
         self.model.train()
@@ -462,14 +675,32 @@ class GroundUpTrainer:
     def train(self,
               dataset_source,
               output_dir: str,
-              epochs:       int   = 5,
-              batch_size:   int   = 2,
-              grad_accum:   int   = 8,
-              learning_rate: float = 1e-3,
-              max_length:   int   = 256,
-              warmup_ratio: float = 0.05,
-              save_every_n_steps: int = 500,
+              epochs:             int   = 5,
+              batch_size:         int   = 2,
+              grad_accum:         int   = 8,
+              learning_rate:      float = 1e-3,
+              max_length:         int   = 256,
+              warmup_ratio:       float = 0.05,
+              save_every_n_steps: int   = 500,
+              # ── Probe-driven adaptive LR ──────────────────────────────────
+              probe_bank:         Optional[Dict[str, List[Tuple[str, str]]]] = None,
+              probe_every_n_steps: int  = 200,
+              alr_base:           float = 0.1,
+              alr_scale:          float = 1.8,
+              alr_temperature:    float = 0.05,
+              alr_max_mult:       float = 3.0,
               ) -> dict:
+        """
+        Train a model from random initialisation.
+
+        probe_bank: optional {type: [(prompt, response), ...]} eval pairs.
+          When provided, a SpecialisationProbe runs every probe_every_n_steps
+          optimizer steps.  The per-layer importance scores are fed into
+          RYSAdaptiveLR to recompute per-layer learning rates on the fly:
+            - Layers the probe identifies as load-bearing → higher LR
+            - Flat / unhelpful layers                    → lower LR
+          This replaces the flat cosine schedule with a probe-informed one.
+        """
         from torch.optim import AdamW
         from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -479,19 +710,49 @@ class GroundUpTrainer:
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
                             collate_fn=_collate)
 
-        optimizer = AdamW(self.model.parameters(), lr=learning_rate,
-                          weight_decay=0.01, betas=(0.9, 0.95))
-        total_steps    = math.ceil(len(loader) / grad_accum) * epochs
-        warmup_steps   = int(total_steps * warmup_ratio)
-        scheduler      = CosineAnnealingLR(optimizer, T_max=max(total_steps, 1),
-                                           eta_min=learning_rate * 0.1)
+        layers       = _get_layer_stack(self.model)
+        N            = len(layers)
+        total_steps  = math.ceil(len(loader) / grad_accum) * epochs
+        warmup_steps = int(total_steps * warmup_ratio)
 
+        # Build one param-group per layer so RYSAdaptiveLR can set lr per layer.
+        # Non-layer parameters (embeddings, lm_head, norm) share a single group.
+        layer_param_sets = [set(id(p) for p in layer.parameters()) for layer in layers]
+        all_layer_ids    = set().union(*layer_param_sets)
+
+        other_params = [p for p in self.model.parameters()
+                        if id(p) not in all_layer_ids]
+        layer_groups = [
+            {"params": list(layer.parameters()), "lr": learning_rate}
+            for layer in layers
+        ]
+        param_groups = [{"params": other_params, "lr": learning_rate}] + layer_groups
+
+        optimizer = AdamW(param_groups, weight_decay=0.01, betas=(0.9, 0.95))
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(total_steps, 1),
+                                      eta_min=learning_rate * 0.1)
+
+        # Adaptive LR controller (probe-driven)
+        adaptive_lr = RYSAdaptiveLR(
+            base=alr_base, scale=alr_scale,
+            temperature=alr_temperature, max_mult=alr_max_mult,
+            log=self.log,
+        ) if probe_bank else None
+
+        # Specialisation probe (reuses SpecialisationProbe from this module)
+        probe = SpecialisationProbe(
+            self.model, self.tokenizer, self.device
+        ) if probe_bank else None
+
+        alr_history: List[dict] = []
         loss_history = []
         global_step  = 0
         best_loss    = float("inf")
         best_ckpt    = None
+
         self.log(f"[GroundUp] Training: {epochs} epochs, {len(ds)} samples, "
-                 f"lr={learning_rate}, warmup={warmup_steps} steps")
+                 f"lr={learning_rate}, warmup={warmup_steps} steps"
+                 + (f", probe every {probe_every_n_steps} steps" if probe else ""))
 
         for epoch in range(1, epochs + 1):
             self.model.train()
@@ -507,14 +768,47 @@ class GroundUpTrainer:
 
                 if (step + 1) % grad_accum == 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    # Linear warmup override
+
+                    # Linear warmup: apply to ALL param groups uniformly
                     if global_step < warmup_steps:
+                        warmup_factor = (global_step + 1) / max(warmup_steps, 1)
                         for pg in optimizer.param_groups:
-                            pg["lr"] = learning_rate * (global_step + 1) / max(warmup_steps, 1)
+                            pg["lr"] = learning_rate * warmup_factor
+                    elif adaptive_lr and adaptive_lr.multipliers:
+                        # After warmup: apply probe-derived per-layer LR multipliers.
+                        # layer_groups are param_groups[1:] (index 0 = other params)
+                        adaptive_lr.apply_to_optimizer(
+                            optimizer,
+                            layer_param_groups=optimizer.param_groups[1:],
+                            base_lr=scheduler.get_last_lr()[0]
+                            if hasattr(scheduler, "get_last_lr")
+                            else learning_rate,
+                        )
+
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
+
+                    # ── Probe-driven LR recalculation ─────────────────────
+                    if (probe is not None
+                            and probe_every_n_steps > 0
+                            and global_step % probe_every_n_steps == 0):
+                        self.log(f"[GroundUp] Running specialisation probe "
+                                 f"at step {global_step} ...")
+                        scores = probe.run(probe_bank)
+                        # Reduce: per-layer max importance across all cognitive types
+                        per_layer = [
+                            max(scores[t][i] for t in scores)
+                            for i in range(N)
+                        ]
+                        mults = adaptive_lr.compute_from_matrix(per_layer)
+                        alr_history.append({
+                            "step": global_step,
+                            "per_layer_scores": [round(s, 5) for s in per_layer],
+                            "lr_multipliers":   [round(m, 5) for m in mults],
+                        })
+                        self.model.train()   # probe sets eval mode; restore
 
                     if save_every_n_steps and global_step % save_every_n_steps == 0:
                         ckpt = os.path.join(output_dir, f"step_{global_step}")
@@ -536,6 +830,7 @@ class GroundUpTrainer:
             "model_source": self.model_source,
             "epochs": epochs, "loss_history": loss_history,
             "best_checkpoint": best_ckpt,
+            "adaptive_lr_history": alr_history,
         }
         with open(os.path.join(output_dir, "training_log.json"), "w") as f:
             json.dump(log_data, f, indent=2)
@@ -1027,4 +1322,619 @@ class StretchDistillPipeline:
         with open(os.path.join(output_dir, "training_log.json"), "w") as f:
             json.dump(log_data, f, indent=2)
         self.log(f"[Stretch] Distillation complete → {final}")
+        return log_data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TrainingModule — defines a cognitive domain + its emergence response
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TrainingModule:
+    """
+    Defines a single cognitive domain that the ModularGroundUpTrainer monitors.
+
+    Fields
+    ------
+    name            : Human-readable label, e.g. "math", "code", "reasoning"
+    probe_bank      : {type: [(prompt, response), ...]} — keyed by cognitive type
+    finetune_dataset: Dataset to use when emergence is triggered.
+                      Accepts list of (prompt,response), .json path, or HF name.
+    finetune_method : What to do when emergence is detected:
+                        "lora"       — inject LoRA into the minimal emerged range
+                        "junction"   — train only the two boundary layers
+                        "full_layer" — fully unfreeze emerged range, finetune,
+                                       then re-freeze
+                        "stretch"    — insert blank layers around the emerged
+                                       range via LayerSurgeon, reload model
+    emergence_threshold   : Minimum score for the best contiguous range to
+                            trigger (score = loss_delta when range is disabled)
+    min_subset_ratio      : When shrinking to minimal subset, keep sub-ranges
+                            whose score is >= this fraction of the best range
+                            score.  0.75 = accept up to 25% signal loss for
+                            a smaller target range.
+    finetune_epochs       : Training epochs when triggered
+    finetune_lr           : Learning rate for the triggered finetune pass
+    lora_rank / lora_alpha: LoRA hyperparams (finetune_method="lora" only)
+    n_blank_layers        : Blank layers to insert (finetune_method="stretch" only)
+    retrigger_after_steps : Minimum steps between re-triggers for this module
+    """
+
+    name:                   str
+    probe_bank:             Dict[str, List[Tuple[str, str]]]
+    finetune_dataset:       Any
+    finetune_method:        str   = "lora"
+    emergence_threshold:    float = 0.02
+    min_subset_ratio:       float = 0.75
+    finetune_epochs:        int   = 1
+    finetune_lr:            float = 2e-4
+    lora_rank:              int   = 8
+    lora_alpha:             float = 16.0
+    n_blank_layers:         int   = 2
+    retrigger_after_steps:  int   = 500
+
+    # ── Runtime state (not user-configured) ──────────────────────────────────
+    last_triggered_step:    int         = field(default=-1,             repr=False)
+    trigger_history:        List[dict]  = field(default_factory=list,   repr=False)
+    emergent_layers:        List[int]   = field(default_factory=list,   repr=False)
+    lora_injected:          bool        = field(default=False,          repr=False)
+    stretch_layer_offset:   int         = field(default=0,              repr=False)
+
+    VALID_METHODS = ("lora", "junction", "full_layer", "stretch")
+
+    def __post_init__(self):
+        if self.finetune_method not in self.VALID_METHODS:
+            raise ValueError(f"finetune_method must be one of {self.VALID_METHODS}")
+
+    def cooldown_active(self, global_step: int) -> bool:
+        return (self.last_triggered_step >= 0
+                and global_step - self.last_triggered_step < self.retrigger_after_steps)
+
+    def to_dict(self) -> dict:
+        return {
+            "name":               self.name,
+            "finetune_method":    self.finetune_method,
+            "trigger_history":    self.trigger_history,
+            "emergent_layers":    self.emergent_layers,
+            "last_triggered_step": self.last_triggered_step,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ModularGroundUpTrainer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ModularGroundUpTrainer:
+    """
+    Ground-up trainer with pluggable cognitive modules.
+
+    Architecture
+    ────────────
+    Main loop  — trains on a general-purpose dataset, building broad language
+                 capability from random initialisation.
+
+    Modules    — each module watches for a specific cognitive type to emerge
+                 naturally from the general training signal.  Every
+                 `probe_interval` optimizer steps all module probes run.
+
+    Emergence  — when a module's SpecialisationProbe sees >= min_emergent_layers
+                 layers cross the emergence_threshold, that module fires:
+                   1. Logs which layers emerged and their scores
+                   2. Runs the module's chosen finetune_method on those layers
+                      using the module's own finetune_dataset
+                   3. Resumes main training with the now-specialised layers
+
+    Per-module finetune methods
+    ───────────────────────────
+    lora        LoRA adapters are injected once into emerged layers and kept
+                live for all subsequent main-training steps too.  Re-triggers
+                add new adapters only to layers not already covered.
+
+    junction    Freeze everything, train only the two boundary layers flanking
+                the emerged region.  Clean, minimal, matches dnhkng's hypothesis.
+
+    full_layer  Fully unfreeze emerged layers, run finetune epochs, then
+                re-freeze them so main training doesn't overwrite gains.
+
+    stretch     Export the current model, insert `n_blank_layers` blank layers
+                immediately around the emerged region via LayerSurgeon, reload
+                the expanded model, and continue training.  The blank layers
+                give the emerging circuit room to grow.
+                ⚠ Resets optimizer state and changes layer indices.
+
+    Usage
+    ─────
+        modules = [
+            TrainingModule(
+                name="math",
+                probe_bank={"math": [("What is 3*3?", "9"), ...]},
+                finetune_dataset="path/to/math_pairs.json",
+                finetune_method="lora",
+                emergence_threshold=0.02,
+                min_emergent_layers=2,
+            ),
+            TrainingModule(
+                name="code",
+                probe_bank={"code": [("Write hello world", "print('hello')"), ...]},
+                finetune_dataset="codeparrot/github-code",
+                finetune_method="full_layer",
+            ),
+        ]
+        trainer = ModularGroundUpTrainer(
+            model_source="Qwen/Qwen2-0.5B",
+            modules=modules,
+            probe_interval=200,
+        )
+        trainer.train(general_dataset, output_dir="./run1", epochs=20)
+    """
+
+    def __init__(self,
+                 model_source:    str,
+                 modules:         List[TrainingModule],
+                 probe_interval:  int      = 200,
+                 device:          str      = "cuda",
+                 log:             Callable = print):
+        self.model_source   = model_source
+        self.modules        = modules
+        self.probe_interval = probe_interval
+        self.device         = torch.device(
+            device if torch.cuda.is_available() and "cuda" in device else "cpu")
+        self.log = log
+
+        self._load_model(model_source)
+        self.log(f"[Modular] Registered {len(modules)} modules: "
+                 f"{[m.name for m in modules]}")
+
+    # ── Model loading ────────────────────────────────────────────────────────
+
+    def _load_model(self, source: str, from_checkpoint: bool = False):
+        from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+
+        self.log(f"[Modular] Loading model from {source} ...")
+        self.tokenizer = AutoTokenizer.from_pretrained(source)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if from_checkpoint:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                source, torch_dtype=torch.float32, device_map=None
+            ).to(self.device)
+        else:
+            config = AutoConfig.from_pretrained(source)
+            config.use_cache = False
+            self.model = AutoModelForCausalLM.from_config(
+                config, torch_dtype=torch.float32
+            ).to(self.device)
+
+        self.model.config.use_cache = False
+        self.layers = _get_layer_stack(self.model)
+        self.N = len(self.layers)
+        total = sum(p.numel() for p in self.model.parameters())
+        self.log(f"[Modular] Model ready — {self.N} layers, {total/1e6:.1f}M params")
+
+    # ── Probe runner ─────────────────────────────────────────────────────────
+
+    def _run_all_probes(self, global_step: int, output_dir: str,
+                        main_optimizer, base_lr: float, max_length: int):
+        """
+        Probe every module that is not in cooldown using RYS sweep.
+
+        Emergence condition: the best (i,j) RYS delta on the module's probe
+        questions exceeds emergence_threshold.  A positive delta means
+        repeating that range IMPROVES math performance — those layers are
+        already good at the task and are the right target for finetuning.
+
+        Returns True if a stretch reload occurred.
+        """
+        probe    = RYSProbe(self.model, self.tokenizer, self.device,
+                            log=self.log)
+        reloaded = False
+
+        for module in self.modules:
+            if module.cooldown_active(global_step):
+                self.log(f"[Modular] Module '{module.name}' in cooldown "
+                         f"({global_step - module.last_triggered_step}/"
+                         f"{module.retrigger_after_steps} steps)")
+                continue
+
+            self.log(f"[Modular] RYS probing module '{module.name}' "
+                     f"at step {global_step} ...")
+            try:
+                results = probe.run(
+                    module.probe_bank,
+                    find_minimal_subset=True,
+                    min_subset_ratio=module.min_subset_ratio,
+                )
+            except Exception as e:
+                import traceback
+                self.log(f"[Modular] ✗ Probe error for '{module.name}': {e}\n"
+                         f"{traceback.format_exc()}")
+                probe._restore_all()
+                self.model.train()
+                continue
+
+            # Take the type with the highest positive RYS delta
+            best_type  = max(results, key=lambda t: results[t]["best_score"])
+            r          = results[best_type]
+            best_score = r["best_score"]   # positive = already good at task
+            fs, fe     = r["final_start"], r["final_end"]
+            fscore     = r["final_score"]
+
+            self.log(
+                f"[Modular] '{module.name}' RYS result: "
+                f"best_type='{best_type}'  "
+                f"best=[{r['best_start']},{r['best_end']}] "
+                f"delta={best_score:+.5f}  "
+                f"minimal=[{fs},{fe}] delta={fscore:+.5f}  "
+                f"threshold={module.emergence_threshold:+.5f}"
+            )
+
+            if best_score >= module.emergence_threshold:
+                self.log(
+                    f"[Modular] ✦ EMERGENCE: '{module.name}' layers [{fs},{fe}] "
+                    f"are already good at {best_type} "
+                    f"(RYS delta={best_score:+.5f}) — finetuning further."
+                )
+                module.emergent_layers     = list(range(fs, fe + 1))
+                module.last_triggered_step = global_step
+
+                event = {
+                    "step":          global_step,
+                    "best_range":    [r["best_start"], r["best_end"]],
+                    "best_delta":    round(best_score, 5),
+                    "minimal_range": [fs, fe],
+                    "minimal_delta": round(fscore, 5),
+                    "probe_type":    best_type,
+                    "acting_layers": module.emergent_layers,
+                }
+
+                try:
+                    did_reload = self._finetune_module(
+                        module, module.emergent_layers,
+                        output_dir, global_step, max_length)
+                    event["finetune_complete"] = True
+                except Exception as e:
+                    import traceback
+                    self.log(f"[Modular] ✗ Finetune error for '{module.name}': {e}\n"
+                             f"{traceback.format_exc()}")
+                    event["finetune_complete"] = False
+                    did_reload = False
+
+                module.trigger_history.append(event)
+
+                if did_reload:
+                    reloaded = True
+                    self.layers = _get_layer_stack(self.model)
+                    self.N      = len(self.layers)
+            else:
+                self.log(
+                    f"[Modular] '{module.name}' best delta={best_score:+.5f} "
+                    f"below threshold {module.emergence_threshold:+.5f} — "
+                    f"math capability not yet emerged"
+                )
+
+        self.model.train()
+        return reloaded
+
+    # ── Per-module finetune dispatch ─────────────────────────────────────────
+
+    def _finetune_module(self, module: TrainingModule, emergent: List[int],
+                         output_dir: str, global_step: int,
+                         max_length: int) -> bool:
+        """
+        Run the module's configured finetune method on the exact emergent layers.
+
+        emergent is the full list of layer indices that crossed the threshold —
+        e.g. [3, 9, 14].  Each finetune method operates on these specific layers
+        rather than the bounding-box range, so non-emergent layers in between
+        are not touched.
+
+        Returns True if a model reload occurred (stretch method).
+        """
+        method = module.finetune_method
+        self.log(f"[Modular] Finetuning '{module.name}' via {method} "
+                 f"on emergent layers {emergent} ...")
+
+        if method == "lora":
+            return self._ft_lora(module, emergent,
+                                 output_dir, global_step, max_length)
+        elif method == "junction":
+            return self._ft_junction(module, emergent,
+                                     output_dir, global_step, max_length)
+        elif method == "full_layer":
+            return self._ft_full_layer(module, emergent,
+                                       output_dir, global_step, max_length)
+        elif method == "stretch":
+            return self._ft_stretch(module, emergent,
+                                    output_dir, global_step, max_length)
+        return False
+
+    def _make_finetune_loader(self, module: TrainingModule,
+                              max_length: int) -> DataLoader:
+        ds = load_dataset_from_source(
+            module.finetune_dataset, self.tokenizer, max_length)
+        return DataLoader(ds, batch_size=1, shuffle=True, collate_fn=_collate)
+
+    def _run_finetune_loop(self, module: TrainingModule, optimizer,
+                           loader: DataLoader, epochs: int, label: str):
+        """Shared inner training loop for all non-stretch finetune methods."""
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=max(len(loader) * epochs, 1))
+        for ep in range(1, epochs + 1):
+            self.model.train()
+            ep_loss = 0.0
+            for batch in loader:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                out   = self.model(**batch)
+                out.loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                ep_loss += out.loss.item()
+            avg = ep_loss / max(len(loader), 1)
+            self.log(f"[Modular] {label} ep {ep}/{epochs} loss={avg:.5f}")
+
+    # ── lora ─────────────────────────────────────────────────────────────────
+
+    def _ft_lora(self, module, emergent: List[int],
+                 output_dir, step, max_length) -> bool:
+        from torch.optim import AdamW
+        if not module.lora_injected:
+            # Inject LoRA into each emergent layer individually (not the full range)
+            total_injected = []
+            for idx in emergent:
+                injected = inject_lora(
+                    self.model, idx, idx,
+                    rank=module.lora_rank, alpha=module.lora_alpha)
+                total_injected.extend(injected)
+            module.lora_injected = True
+            self.log(f"[Modular] Injected LoRA into {len(total_injected)} modules "
+                     f"across layers {emergent}")
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable, lr=module.finetune_lr)
+        loader    = self._make_finetune_loader(module, max_length)
+        self._run_finetune_loop(module, optimizer, loader,
+                                module.finetune_epochs,
+                                f"LoRA[{module.name}]")
+        ckpt = os.path.join(output_dir, f"module_{module.name}_step{step}")
+        self._save(ckpt)
+        return False
+
+    # ── junction ─────────────────────────────────────────────────────────────
+
+    def _ft_junction(self, module, emergent: List[int],
+                     output_dir, step, max_length) -> bool:
+        from torch.optim import AdamW
+        freeze_all(self.model)
+        # For each emergent layer, train its immediate neighbours (the seam layers)
+        junctions = set()
+        for idx in emergent:
+            if idx > 0:
+                junctions.add(idx - 1)
+            junctions.add(idx)
+            if idx + 1 < self.N:
+                junctions.add(idx + 1)
+        for idx in junctions:
+            unfreeze_layer(self.layers[idx])
+        self.log(f"[Modular] Junction layers around {emergent}: {sorted(junctions)}")
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable, lr=module.finetune_lr)
+        loader    = self._make_finetune_loader(module, max_length)
+        self._run_finetune_loop(module, optimizer, loader,
+                                module.finetune_epochs,
+                                f"Junction[{module.name}]")
+        for p in self.model.parameters():
+            p.requires_grad = True
+        ckpt = os.path.join(output_dir, f"module_{module.name}_step{step}")
+        self._save(ckpt)
+        return False
+
+    # ── full_layer ───────────────────────────────────────────────────────────
+
+    def _ft_full_layer(self, module, emergent: List[int],
+                       output_dir, step, max_length) -> bool:
+        from torch.optim import AdamW
+        freeze_all(self.model)
+        for idx in emergent:
+            unfreeze_layer(self.layers[idx])
+        self.log(f"[Modular] Full-layer finetune on exact emergent layers {emergent}")
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable, lr=module.finetune_lr)
+        loader    = self._make_finetune_loader(module, max_length)
+        self._run_finetune_loop(module, optimizer, loader,
+                                module.finetune_epochs,
+                                f"FullLayer[{module.name}]")
+        for p in self.model.parameters():
+            p.requires_grad = True
+        ckpt = os.path.join(output_dir, f"module_{module.name}_step{step}")
+        self._save(ckpt)
+        return False
+
+    # ── stretch ──────────────────────────────────────────────────────────────
+
+    def _ft_stretch(self, module, emergent: List[int],
+                    output_dir, step, max_length) -> bool:
+        """
+        Export → insert blank layers immediately after each emergent layer → reload.
+
+        Inserts n_blank_layers after the highest-scored emergent layer only,
+        to give the most active circuit room to grow without fragmenting the
+        model with multiple insertion points in one pass.
+
+        ⚠ Resets optimizer state and shifts all layer indices above the
+          insertion point.
+        """
+        from layer_surgeon import LayerSurgeon
+        interim_dir = os.path.join(output_dir, f"stretch_{module.name}_step{step}")
+        self.log(f"[Modular] Stretch: exporting current model to {interim_dir} ...")
+        self._save(interim_dir)
+
+        surgeon = LayerSurgeon(interim_dir, device=str(self.device))
+
+        # Insert after the last emergent layer — highest in the stack,
+        # so earlier index shifts don't invalidate the insertion point.
+        insert_after = max(emergent)
+        for i in range(module.n_blank_layers):
+            slot = surgeon.insert_blank_layer(insert_after + i)
+            self.log(f"[Modular] Stretch: inserted blank layer at slot {slot} "
+                     f"(after emergent layer {insert_after})")
+
+        stretched_dir = interim_dir + "_stretched"
+        surgeon.export(stretched_dir)
+        self.log(f"[Modular] Stretch: reloading expanded model ({stretched_dir}) ...")
+
+        self._load_model(stretched_dir, from_checkpoint=True)
+        module.stretch_layer_offset += module.n_blank_layers
+        self.log(f"[Modular] Stretch: model reloaded — now {self.N} layers. "
+                 f"Emergent layers were {emergent}. "
+                 f"⚠ Optimizer state reset.")
+        return True
+
+    # ── Save helper ──────────────────────────────────────────────────────────
+
+    def _save(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        self.model.save_pretrained(directory)
+        self.tokenizer.save_pretrained(directory)
+        self.log(f"[Modular] Saved → {directory}")
+
+    # ── Main training loop ───────────────────────────────────────────────────
+
+    def train(self,
+              dataset_source,
+              output_dir:    str,
+              epochs:        int   = 20,
+              batch_size:    int   = 2,
+              grad_accum:    int   = 8,
+              learning_rate: float = 1e-3,
+              max_length:    int   = 256,
+              warmup_ratio:  float = 0.05,
+              save_every_n_steps: int = 500,
+              ) -> dict:
+        """
+        Main training loop.
+
+        Every `probe_interval` optimizer steps:
+          1. All non-cooldown modules are probed.
+          2. Any module that crosses its emergence threshold fires its
+             configured finetune method.
+          3. If a stretch reload occurred the optimizer is rebuilt from scratch
+             (layer indices changed).  All other methods resume seamlessly.
+        """
+        from torch.optim import AdamW
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+
+        os.makedirs(output_dir, exist_ok=True)
+        self.log("[Modular] Preparing general training dataset ...")
+        ds     = load_dataset_from_source(dataset_source, self.tokenizer, max_length)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                            collate_fn=_collate)
+
+        total_steps  = math.ceil(len(ds) / (batch_size * grad_accum)) * epochs
+        warmup_steps = int(total_steps * warmup_ratio)
+
+        def _build_optimizer():
+            """Build per-layer param groups for adaptive LR support."""
+            layers      = _get_layer_stack(self.model)
+            layer_ids   = set().union(*(set(id(p) for p in l.parameters())
+                                        for l in layers))
+            other       = [p for p in self.model.parameters()
+                           if id(p) not in layer_ids]
+            groups      = [{"params": other, "lr": learning_rate}]
+            groups     += [{"params": list(l.parameters()), "lr": learning_rate}
+                           for l in layers]
+            opt = AdamW(groups, weight_decay=0.01, betas=(0.9, 0.95))
+            sched = CosineAnnealingLR(opt, T_max=max(total_steps, 1),
+                                      eta_min=learning_rate * 0.1)
+            return opt, sched
+
+        optimizer, scheduler = _build_optimizer()
+
+        loss_history     = []
+        global_step      = 0
+        best_loss        = float("inf")
+        best_ckpt        = None
+        module_log: list = []
+
+        self.log(f"[Modular] Starting: {epochs} epochs, {len(ds)} samples, "
+                 f"probe every {self.probe_interval} steps, "
+                 f"{len(self.modules)} modules active")
+
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            epoch_loss = 0.0
+            optimizer.zero_grad()
+
+            for step, batch in enumerate(loader):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                out   = self.model(**batch)
+                loss  = out.loss / grad_accum
+                loss.backward()
+                epoch_loss += loss.item() * grad_accum
+
+                if (step + 1) % grad_accum == 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                    # Warmup
+                    if global_step < warmup_steps:
+                        factor = (global_step + 1) / max(warmup_steps, 1)
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = learning_rate * factor
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                    # ── Module probe cycle ────────────────────────────────
+                    if (self.probe_interval > 0
+                            and global_step % self.probe_interval == 0):
+                        reloaded = self._run_all_probes(
+                            global_step, output_dir,
+                            optimizer,
+                            scheduler.get_last_lr()[0]
+                                if hasattr(scheduler, "get_last_lr")
+                                else learning_rate,
+                            max_length,
+                        )
+                        # Stretch reload changes layer count — rebuild optimizer
+                        if reloaded:
+                            self.log("[Modular] Rebuilding optimizer after stretch reload")
+                            optimizer, scheduler = _build_optimizer()
+
+                        module_log.append({
+                            "step": global_step,
+                            "module_states": [m.to_dict() for m in self.modules],
+                        })
+                        self.model.train()
+
+                    if save_every_n_steps and global_step % save_every_n_steps == 0:
+                        self._save(os.path.join(output_dir, f"step_{global_step}"))
+
+            avg = epoch_loss / max(len(loader), 1)
+            loss_history.append({"epoch": epoch, "loss": round(avg, 6)})
+            self.log(f"[Modular] Epoch {epoch}/{epochs} — loss={avg:.6f}")
+            ckpt = os.path.join(output_dir, f"epoch_{epoch}")
+            self._save(ckpt)
+            if avg < best_loss:
+                best_loss = avg
+                best_ckpt = ckpt
+
+        final = os.path.join(output_dir, "final")
+        self._save(final)
+
+        log_data = {
+            "mode":            "modular_ground_up",
+            "model_source":    self.model_source,
+            "epochs":          epochs,
+            "loss_history":    loss_history,
+            "best_checkpoint": best_ckpt,
+            "module_log":      module_log,
+            "final_modules":   [m.to_dict() for m in self.modules],
+        }
+        with open(os.path.join(output_dir, "training_log.json"), "w") as f:
+            json.dump(log_data, f, indent=2)
+
+        self.log(f"[Modular] Done. Best checkpoint: {best_ckpt}")
         return log_data

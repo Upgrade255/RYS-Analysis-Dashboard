@@ -121,6 +121,7 @@ def load_rys_model(dropdown_model, typed_model):
         return "Select a model", None, None, *[gr.update() for _ in layer_buttons]
     engine = RYSEngine(model_name)
     config = AutoConfig.from_pretrained(model_name)
+
     def _cfg(attr, fallback="?"):
         return getattr(config, attr, None) or getattr(config, "text_config", object()).__class__.__dict__.get(attr,
                                                                                                               fallback)
@@ -724,7 +725,11 @@ with gr.Blocks(title="RYS + Surgery + Training") as demo:
         with gr.Accordion("Ground-Up Settings", open=True):
             gr.Markdown(
                 "Loads the **architecture** (config) of the specified model and re-initialises "
-                "all weights randomly. Train an entirely fresh model from that blueprint."
+                "all weights randomly. Train an entirely fresh model from that blueprint.\n\n"
+                "**Probe bank** (optional): provide typed eval pairs and the trainer will run "
+                "a `SpecialisationProbe` every N steps, converting per-layer importance scores "
+                "into per-layer learning rate multipliers via `RYSAdaptiveLR`. "
+                "Load-bearing layers get boosted LR; flat/unhelpful layers get reduced LR."
             )
             gu_model    = gr.Textbox(label="Architecture Source (model path or HF ID)",
                                      placeholder="Qwen/Qwen2-0.5B")
@@ -737,6 +742,19 @@ with gr.Blocks(title="RYS + Surgery + Training") as demo:
                 gu_lr       = gr.Number(value=1e-3,                label="Learning Rate")
                 gu_maxlen   = gr.Slider(64, 1024, step=64, value=256, label="Max Length")
                 gu_save_n   = gr.Number(value=500, precision=0,   label="Save every N steps")
+            gr.Markdown("#### Probe-Driven Adaptive LR _(optional)_")
+            gu_probe_bank = gr.Textbox(
+                label="Probe bank JSON (same format as Layer-Aware)",
+                lines=4,
+                placeholder='{"math": [["What is 3*3?", "9"]], "code": [["Write hello world", "print(\'hello\')"]]}',
+            )
+            with gr.Row():
+                gu_probe_every = gr.Slider(0, 1000, step=50, value=200,
+                                           label="Probe every N steps (0=disabled)")
+                gu_alr_base   = gr.Number(value=0.1,  label="ALR base multiplier")
+                gu_alr_scale  = gr.Number(value=1.8,  label="ALR scale")
+                gu_alr_temp   = gr.Number(value=0.05, label="ALR temperature")
+                gu_alr_cap    = gr.Number(value=3.0,  label="ALR max multiplier")
 
         # ── Layer-Aware settings ───────────────────────────────────────────────
         with gr.Accordion("Layer-Aware Settings", open=False):
@@ -847,6 +865,8 @@ with gr.Blocks(title="RYS + Surgery + Training") as demo:
         def run_advanced(mode, ds_type, ds_text, ds_file, ds_hf,
                          gu_model, gu_out, gu_epochs, gu_batch, gu_accum,
                          gu_lr, gu_maxlen, gu_save_n,
+                         gu_probe_bank, gu_probe_every,
+                         gu_alr_base, gu_alr_scale, gu_alr_temp, gu_alr_cap,
                          la_model, la_out, la_epochs, la_batch, la_accum,
                          la_lr, la_probe_every, la_spec_thresh, la_probe_bank,
                          sd_model, sd_out, sd_n_blanks, sd_after,
@@ -863,13 +883,26 @@ with gr.Blocks(title="RYS + Surgery + Training") as demo:
             try:
                 if mode == "ground_up":
                     from adaptive_trainer import GroundUpTrainer
+                    probe_bank = None
+                    if gu_probe_bank and gu_probe_bank.strip():
+                        raw = json.loads(gu_probe_bank)
+                        probe_bank = {k: [tuple(p) for p in v] for k, v in raw.items()}
                     t = GroundUpTrainer(gu_model, log=_adv_log)
-                    log = t.train(dataset, gu_out, epochs=int(gu_epochs),
-                                  batch_size=int(gu_batch),
-                                  grad_accum=int(gu_accum),
-                                  learning_rate=float(gu_lr),
-                                  max_length=int(gu_maxlen),
-                                  save_every_n_steps=int(gu_save_n))
+                    log = t.train(
+                        dataset, gu_out,
+                        epochs=int(gu_epochs),
+                        batch_size=int(gu_batch),
+                        grad_accum=int(gu_accum),
+                        learning_rate=float(gu_lr),
+                        max_length=int(gu_maxlen),
+                        save_every_n_steps=int(gu_save_n),
+                        probe_bank=probe_bank,
+                        probe_every_n_steps=int(gu_probe_every),
+                        alr_base=float(gu_alr_base),
+                        alr_scale=float(gu_alr_scale),
+                        alr_temperature=float(gu_alr_temp),
+                        alr_max_mult=float(gu_alr_cap),
+                    )
 
                 elif mode == "layer_aware":
                     from adaptive_trainer import LayerAwareTrainer
@@ -1023,6 +1056,8 @@ with gr.Blocks(title="RYS + Surgery + Training") as demo:
             [adv_mode,
              adv_ds_type, adv_ds_text, adv_ds_file, adv_ds_hf,
              gu_model, gu_out, gu_epochs, gu_batch, gu_accum, gu_lr, gu_maxlen, gu_save_n,
+             gu_probe_bank, gu_probe_every,
+             gu_alr_base, gu_alr_scale, gu_alr_temp, gu_alr_cap,
              la_model, la_out, la_epochs, la_batch, la_accum, la_lr,
              la_probe_every, la_spec_thresh, la_probe_bank,
              sd_model, sd_out, sd_n_blanks, sd_after,
@@ -1034,5 +1069,215 @@ with gr.Blocks(title="RYS + Surgery + Training") as demo:
         alr_btn.click(compute_alr,
                       [alr_matrix_path, alr_base, alr_scale, alr_temp, alr_cap],
                       [alr_status, alr_plot])
+
+    # ── TAB 5: Modular Training ───────────────────────────────────────────────
+    with gr.Tab("🧩 Modular Training"):
+        gr.Markdown(
+            "**Modular Ground-Up Training** — trains from scratch on a general dataset "
+            "while watching for cognitive capabilities to emerge naturally.\n\n"
+            "Each **module** defines one capability domain (e.g. math, code, reasoning). "
+            "Every `probe interval` steps, all modules are probed. When a module's layers "
+            "cross the emergence threshold, the module's finetuning method fires automatically "
+            "on those specific layers using the module's own dataset.\n\n"
+            "| Method | What happens at emergence |\n"
+            "|---|---|\n"
+            "| `lora` | LoRA adapters injected into emerged layers, kept live for rest of training |\n"
+            "| `junction` | Freeze all, train only the two boundary layers flanking the emerged region |\n"
+            "| `full_layer` | Fully unfreeze and finetune emerged layers, then re-freeze |\n"
+            "| `stretch` | Export → insert blank layers around emerged region → reload ⚠ resets optimizer |"
+        )
+
+        with gr.Row():
+            mod_model = gr.Textbox(
+                label="Architecture Source (model path or HF ID)",
+                placeholder="Qwen/Qwen2-0.5B"
+            )
+            mod_out = gr.Textbox(label="Output Directory", value="./modular_output")
+
+        gr.Markdown("#### General Training Dataset")
+        mod_ds_type = gr.Radio(
+            choices=["Text pairs (JSON in textbox)", "JSON file path", "HuggingFace dataset name"],
+            value="HuggingFace dataset name",
+            label="Dataset Source"
+        )
+        mod_ds_text = gr.Textbox(label="Pairs JSON", lines=2,
+                                  value='[{"prompt":"Hello","response":"Hi there"}]')
+        mod_ds_file = gr.Textbox(label="JSON File Path", placeholder="./data/train.json")
+        mod_ds_hf   = gr.Textbox(label="HuggingFace Dataset Name",
+                                  value="Dahoas/rm-static",
+                                  placeholder="Dahoas/rm-static")
+
+        gr.Markdown("#### Training Hyperparameters")
+        with gr.Row():
+            mod_epochs   = gr.Slider(1, 50, step=1, value=20,  label="Epochs")
+            mod_batch    = gr.Slider(1, 8,  step=1, value=2,   label="Batch Size")
+            mod_accum    = gr.Slider(1, 32, step=1, value=8,   label="Grad Accumulation")
+        with gr.Row():
+            mod_lr       = gr.Number(value=1e-3,               label="Learning Rate")
+            mod_maxlen   = gr.Slider(64, 512, step=64, value=128, label="Max Length")
+            mod_save_n   = gr.Number(value=500, precision=0,   label="Save every N steps")
+        mod_probe_interval = gr.Slider(50, 1000, step=50, value=200,
+                                        label="Probe interval (steps between all-module sweeps)")
+
+        gr.Markdown("#### Modules")
+        gr.Markdown(
+            "Define each module as a JSON list. Each entry:\n"
+            "```\n"
+            "{\n"
+            '  "name": "math",\n'
+            '  "probe_bank": {"math": [["Q", "A"], ...]},\n'
+            '  "finetune_dataset": "path/or/HF-name",\n'
+            '  "finetune_method": "lora",          // lora | junction | full_layer | stretch\n'
+            '  "emergence_threshold": 0.02,\n'
+            '  "min_emergent_layers": 2,\n'
+            '  "finetune_epochs": 1,\n'
+            '  "finetune_lr": 0.0002,\n'
+            '  "lora_rank": 8,\n'
+            '  "lora_alpha": 16.0,\n'
+            '  "n_blank_layers": 2,\n'
+            '  "retrigger_after_steps": 500\n'
+            "}\n"
+            "```"
+        )
+        mod_modules_json = gr.Textbox(
+            label="Modules JSON",
+            lines=20,
+            value=json.dumps([
+                {
+                    "name": "math",
+                    "probe_bank": {
+                        "math": [
+                            ["What is 14x3", "42"],
+                            ["What is 9473 squared?", "89737729"],
+                            ["What is 78313 multiplied by 88537?", "6933598081"],
+                            ["What is the cube root of 74088000000?", "4200"],
+                            ["What is the cube root of 844444553408?", "9452"]
+                        ]
+                    },
+                    "finetune_dataset": "Dahoas/rm-static",
+                    "finetune_method": "lora",
+                    "emergence_threshold": 0.02,
+                    "min_subset_ratio": 0.75,
+                    "finetune_epochs": 1,
+                    "finetune_lr": 0.0002,
+                    "lora_rank": 8,
+                    "lora_alpha": 16.0,
+                    "n_blank_layers": 2,
+                    "retrigger_after_steps": 500
+                }
+            ], indent=2)
+        )
+
+        mod_run_btn  = gr.Button("▶ Start Modular Training", variant="primary")
+        mod_status   = gr.Textbox(label="Status", lines=3)
+        mod_log      = gr.Textbox(label="Log", lines=14)
+        mod_plot     = gr.Plot(label="Loss Curve")
+        mod_refresh  = gr.Button("↻ Refresh Log")
+
+        _mod_log_buf: list = []
+
+        def _mod_log_fn(msg):
+            _mod_log_buf.append(msg)
+
+        def run_modular(model_src, out_dir,
+                        ds_type, ds_text, ds_file, ds_hf,
+                        epochs, batch, accum, lr, maxlen, save_n,
+                        probe_interval, modules_json):
+            import matplotlib.pyplot as plt
+            _mod_log_buf.clear()
+            try:
+                # Resolve dataset
+                if ds_type == "Text pairs (JSON in textbox)":
+                    dataset = [(d["prompt"], d["response"])
+                               for d in json.loads(ds_text)]
+                elif ds_type == "JSON file path":
+                    dataset = ds_file
+                else:
+                    dataset = ds_hf
+
+                # Parse modules
+                raw_modules = json.loads(modules_json)
+                from adaptive_trainer import TrainingModule, ModularGroundUpTrainer
+                modules = []
+                for m in raw_modules:
+                    probe_bank = {
+                        k: [tuple(p) for p in v]
+                        for k, v in m["probe_bank"].items()
+                    }
+                    modules.append(TrainingModule(
+                        name                 = m["name"],
+                        probe_bank           = probe_bank,
+                        finetune_dataset     = m["finetune_dataset"],
+                        finetune_method      = m.get("finetune_method", "lora"),
+                        emergence_threshold  = float(m.get("emergence_threshold", 0.02)),
+                        min_subset_ratio     = float(m.get("min_subset_ratio", 0.75)),
+                        finetune_epochs      = int(m.get("finetune_epochs", 1)),
+                        finetune_lr          = float(m.get("finetune_lr", 2e-4)),
+                        lora_rank            = int(m.get("lora_rank", 8)),
+                        lora_alpha           = float(m.get("lora_alpha", 16.0)),
+                        n_blank_layers       = int(m.get("n_blank_layers", 2)),
+                        retrigger_after_steps= int(m.get("retrigger_after_steps", 500)),
+                    ))
+
+                trainer = ModularGroundUpTrainer(
+                    model_source   = model_src,
+                    modules        = modules,
+                    probe_interval = int(probe_interval),
+                    log            = _mod_log_fn,
+                )
+                log_data = trainer.train(
+                    dataset_source     = dataset,
+                    output_dir         = out_dir,
+                    epochs             = int(epochs),
+                    batch_size         = int(batch),
+                    grad_accum         = int(accum),
+                    learning_rate      = float(lr),
+                    max_length         = int(maxlen),
+                    save_every_n_steps = int(save_n),
+                )
+
+                xs  = [e["epoch"] for e in log_data["loss_history"]]
+                ys  = [e["loss"]  for e in log_data["loss_history"]]
+                fig, ax = plt.subplots(figsize=(7, 3))
+                ax.plot(xs, ys, marker="o", color="steelblue")
+                ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
+                ax.set_title("Modular Ground-Up Training Loss")
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+
+                # Annotate emergence events on the loss curve
+                for m in modules:
+                    for event in m.trigger_history:
+                        trigger_epoch = next(
+                            (e["epoch"] for e in log_data["loss_history"]
+                             if e.get("step", 0) >= event["step"]),
+                            None)
+                        if trigger_epoch:
+                            ax.axvline(trigger_epoch, color="orange",
+                                       linestyle="--", alpha=0.6,
+                                       label=f"{m.name} emerged")
+                ax.legend(fontsize=7)
+
+                n_triggers = sum(len(m.trigger_history) for m in modules)
+                status = (f"✓ Modular training complete\n"
+                          f"Best checkpoint: {log_data['best_checkpoint']}\n"
+                          f"Total module triggers: {n_triggers}")
+                return status, "\n".join(_mod_log_buf), fig
+
+            except Exception as e:
+                import traceback
+                return f"Error: {e}", traceback.format_exc(), None
+
+        mod_run_btn.click(
+            run_modular,
+            inputs=[
+                mod_model, mod_out,
+                mod_ds_type, mod_ds_text, mod_ds_file, mod_ds_hf,
+                mod_epochs, mod_batch, mod_accum, mod_lr, mod_maxlen, mod_save_n,
+                mod_probe_interval, mod_modules_json,
+            ],
+            outputs=[mod_status, mod_log, mod_plot]
+        )
+        mod_refresh.click(lambda: "\n".join(_mod_log_buf), [], [mod_log])
 
 demo.launch()
