@@ -1,3 +1,6 @@
+JUST TESTING PERMISSIONS IN THE README - KB
+
+
 # RYS Neuroanatomy Dashboard
 
 ![Dashboard Screenshot](sc1.png)
