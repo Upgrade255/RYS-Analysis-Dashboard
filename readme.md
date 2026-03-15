@@ -39,7 +39,7 @@ Please install PyTorch for CPU or CUDA (GPU) based on your needs prior to instal
 
 ```bash
 git clone https://github.com/Upgrade255/rys-analysis-dashboard.git
-cd rys-dashboard
+cd rys-analysis-dashboard
 pip install -r requirements.txt
 python app.py
 ```
