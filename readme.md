@@ -177,7 +177,3 @@ The RYS (Repeat Yourself) technique, the neuroanatomy framing, and the original 
 This dashboard is an independent implementation and extension built on top of those concepts. The RYS engine, layer surgery, training systems, and UI are original work released under the MIT License.
 
 ---
-
-## License
-
-MIT
