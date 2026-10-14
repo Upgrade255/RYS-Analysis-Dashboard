@@ -157,13 +157,13 @@ I want to first use this to analyze how using RYS during initial training can af
 
 These are more ideas I don't have time for (currently):
 
-- Forcing 'neuro-organs' to form in small models?
-- Forming and extracting a complex neural calculator with defined operational layers? (finding the 'math layer group' and masking all but one layer per problem type to force structure?)
-- Are the groups of layers reasonably separable or relevant if they are never allowed to form naturally in the first place?
-- What kind of knowledge distillation is available with this analysis — could we use direct knowledge distillation to directly copy or continue training and fine-tuning on the portions of the models deemed 'good'?
-- If the heatmaps show which layers are associated with that particular 'field of thinking', while also demonstrating where meaningful thinking happens, we could eventually learn to separate translation layers from poorly trained or generalised layers.
+- Forcing 'neuro-organs' to form in small models? <- Guys this was the one haha. More soon
+- Forming and extracting a complex neural calculator with defined operational layers? (finding the 'math layer group' and masking all but one layer per problem type to force structure?) <- Super easy in everything but attention, there it takes some work not gonna lie.
+- Are the groups of layers reasonably separable or relevant if they are never allowed to form naturally in the first place?<-Very interesting question, consider the inverse and you've got yourself a wonderful compression mechanism.
+- What kind of knowledge distillation is available with this analysis — could we use direct knowledge distillation to directly copy or continue training and fine-tuning on the portions of the models deemed 'good'?<- Yes.
+- If the heatmaps show which layers are associated with that particular 'field of thinking', while also demonstrating where meaningful thinking happens, we could eventually learn to separate translation layers from poorly trained or generalised layers.<- Also Yes.
 
-But those are just my initial thoughts.
+But those are just my initial thoughts. <- They mostly panned out, it's like a 40 step process, but I am confident someone can do it before I make it.
 
 ---
 
